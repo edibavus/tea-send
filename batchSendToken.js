@@ -1,132 +1,92 @@
-require('dotenv').config();
+require("dotenv").config();
 const { ethers } = require("ethers");
+const prompt = require("prompt-sync")();
 const fs = require("fs");
 const path = require("path");
-const prompt = require("prompt-sync")({ sigint: true });
 
-// ====== INPUT USER ======
-const TOKEN_ADDRESS = prompt("🪙 Masukkan alamat token ERC20: ").trim();
-const MIN_TOKEN = prompt("🔢 Minimum token per wallet (contoh: 0.003): ").trim();
-const MAX_TOKEN = prompt("🔢 Maksimum token per wallet (contoh: 1): ").trim();
-const DELAY_MIN = parseInt(prompt("⏱️ Delay minimum antar tx (detik): ").trim());
-const DELAY_MAX = parseInt(prompt("⏱️ Delay maksimum antar tx (detik): ").trim());
+// ====== RPC & Wallet Setup ======
+const provider = new ethers.JsonRpcProvider("https://tea-sepolia.g.alchemy.com/public");
+const PRIVATE_KEY = process.env.PRIVATE_KEY;
+const wallet = new ethers.Wallet(PRIVATE_KEY, provider);
 
-let delayMinMs = isNaN(DELAY_MIN) ? 1000 : DELAY_MIN * 1000;
-let delayMaxMs = isNaN(DELAY_MAX) ? 30000 : DELAY_MAX * 1000;
+// ====== Load Recipients ======
+const recipientsPath = path.join(__dirname, "recipients.txt");
+const recipients = fs
+  .readFileSync(recipientsPath, "utf8")
+  .split("\n")
+  .map((line) => line.trim())
+  .filter((line) => line !== "");
 
-if (delayMinMs > delayMaxMs) {
-  console.log("⚠️ Delay minimum lebih besar dari maksimum, menggunakan default 1–30 detik.");
-  delayMinMs = 1000;
-  delayMaxMs = 30000;
+// ====== CLI Input ======
+const minAmount = parseFloat(prompt("🔢 Minimum TEA per wallet (misal: 0.003): "));
+const maxAmount = parseFloat(prompt("🔢 Maksimum TEA per wallet (misal: 1): "));
+const minDelay = parseInt(prompt("⏱️ Delay minimum antar tx (detik): "), 10);
+const maxDelay = parseInt(prompt("⏱️ Delay maksimum antar tx (detik): "), 10);
+
+console.log(`\n🚀 Akan mengirim TEA dari wallet ${wallet.address}`);
+console.log(`🎯 Jumlah wallet: ${recipients.length}`);
+console.log(`💸 Min TEA: ${minAmount}, Max TEA: ${maxAmount}`);
+console.log(`⏳ Delay: ${minDelay}s ~ ${maxDelay}s\n`);
+
+// ====== Estimasi Total Kebutuhan ======
+function getRandomAmount() {
+  return (Math.random() * (maxAmount - minAmount) + minAmount);
+}
+const estimatedTotal = recipients.reduce((total) => total + getRandomAmount(), 0);
+console.log(`💰 Estimasi kebutuhan total: ~${estimatedTotal.toFixed(4)} TEA`);
+
+const confirm = prompt("Ketik 'yes' untuk lanjut: ");
+if (confirm.toLowerCase() !== "yes") {
+  console.log("❌ Dibatalkan.");
+  process.exit();
 }
 
-const CONFIRM = prompt(`\n⚠️ Kirim token dari wallet di .env ke semua wallet di recipients.txt?\nMIN: ${MIN_TOKEN}, MAX: ${MAX_TOKEN}, Token: ${TOKEN_ADDRESS}\nKetik 'yes' untuk lanjut: `).toLowerCase();
-
-if (CONFIRM !== 'yes') {
-  console.log("❌ Operasi dibatalkan.");
-  process.exit(0);
-}
-
-// ====== CONFIG ======
-const RPC_URL = "https://tea-sepolia.g.alchemy.com/public";
-const LOG_FILE = path.join(__dirname, "batch-log.csv");
-const RECIPIENTS_PATH = path.join(__dirname, "recipients.txt");
-const provider = new ethers.JsonRpcProvider(RPC_URL);
-const wallet = new ethers.Wallet(process.env.PRIVATE_KEY, provider);
-
-// ====== ERC20 ABI ======
-const ERC20_ABI = [
-  "function balanceOf(address) view returns (uint)",
-  "function transfer(address to, uint amount) returns (bool)",
-  "function decimals() view returns (uint8)",
-  "function symbol() view returns (string)"
-];
-
-// ====== UTIL ======
-const delay = (ms) => new Promise(res => setTimeout(res, ms));
-
-function initLog() {
-  if (!fs.existsSync(LOG_FILE)) {
-    fs.writeFileSync(LOG_FILE, "Recipient,Status,TxHash/Error\n");
+// ====== Cek Saldo Wallet ======
+async function checkBalance() {
+  const balance = await provider.getBalance(wallet.address);
+  const balanceInTEA = parseFloat(ethers.formatEther(balance));
+  if (balanceInTEA < estimatedTotal) {
+    console.log(`❌ Saldo tidak cukup: hanya ${balanceInTEA} TEA`);
+    process.exit();
+  } else {
+    console.log(`✅ Saldo cukup: ${balanceInTEA} TEA\n`);
   }
 }
 
-function writeLog(recipient, status, info) {
-  const row = `"${recipient}","${status}","${info}"\n`;
-  fs.appendFileSync(LOG_FILE, row);
+// ====== Helper Delay ======
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-// ====== LOAD WALLET LIST ======
-let RECIPIENTS = [];
-try {
-  const raw = fs.readFileSync(RECIPIENTS_PATH, "utf8");
-  const lines = raw.split(/\r?\n/).map(line => line.trim());
-  RECIPIENTS = lines.filter(addr => ethers.isAddress(addr));
-  console.log(`📥 ${RECIPIENTS.length} alamat dimuat dari recipients.txt\n`);
-} catch (error) {
-  console.error("❌ Gagal membaca recipients.txt:", error.message);
-  process.exit(1);
-}
+// ====== Proses Kirim Native Token ======
+async function sendNativeTokens() {
+  await checkBalance();
+  const logFile = path.join(__dirname, "batch-log.csv");
+  fs.writeFileSync(logFile, "Recipient,Status,TxHash/Error\n");
 
-// ====== RANDOM AMOUNT GENERATOR ======
-function getRandomAmount(min, max, decimals) {
-  const rand = Math.random() * (max - min) + min;
-  const fixed = rand.toFixed(decimals > 6 ? 6 : decimals);
-  return ethers.parseUnits(fixed.toString(), decimals);
-}
-
-// ====== MAIN FUNCTION ======
-async function batchSend() {
-  initLog();
-
-  const token = new ethers.Contract(TOKEN_ADDRESS, ERC20_ABI, wallet);
-  const symbol = await token.symbol();
-  const decimals = await token.decimals();
-  const minFloat = parseFloat(MIN_TOKEN);
-  const maxFloat = parseFloat(MAX_TOKEN);
-  let balance = await token.balanceOf(wallet.address);
-
-  // 💡 Generate semua amount yang akan dikirim
-  const amountList = RECIPIENTS.map(() => getRandomAmount(minFloat, maxFloat, decimals));
-  const totalNeeded = amountList.reduce((sum, amt) => sum + BigInt(amt), 0n);
-
-  console.log(`🔐 Wallet: ${wallet.address}`);
-  console.log(`📦 Saldo awal: ${ethers.formatUnits(balance, decimals)} ${symbol}`);
-  console.log(`🧮 Total estimasi pengiriman: ${ethers.formatUnits(totalNeeded, decimals)} ${symbol}`);
-
-  if (balance < totalNeeded) {
-    console.log("❌ Saldo tidak mencukupi untuk semua transaksi. Operasi dibatalkan.");
-    return;
-  }
-
-  console.log(`✅ Saldo cukup. Memulai pengiriman...\n`);
-
-  for (let i = 0; i < RECIPIENTS.length; i++) {
-    const recipient = RECIPIENTS[i];
-    const amount = amountList[i];
+  for (const recipient of recipients) {
+    const amount = getRandomAmount();
+    const value = ethers.parseEther(amount.toFixed(6));
 
     try {
-      const tx = await token.transfer(recipient, amount);
-      console.log(`⏳ Mengirim ${ethers.formatUnits(amount, decimals)} ${symbol} ke ${recipient}... TX: ${tx.hash}`);
+      const tx = await wallet.sendTransaction({
+        to: recipient,
+        value: value,
+      });
       await tx.wait();
-      console.log(`✅ Berhasil ke ${recipient}`);
-      writeLog(recipient, "SUCCESS", `Tx: ${tx.hash}, Amount: ${ethers.formatUnits(amount, decimals)}`);
-      balance = await token.balanceOf(wallet.address);
+      console.log(`✅ Sukses: ${recipient} ← ${amount.toFixed(6)} TEA (${tx.hash})`);
+      fs.appendFileSync(logFile, `${recipient},SUCCESS,${tx.hash}\n`);
     } catch (err) {
-      const errorMsg = err.reason || err.message || "Unknown error";
-      console.error(`❌ Gagal kirim ke ${recipient}:`, errorMsg);
-      writeLog(recipient, "FAILED", errorMsg);
+      console.log(`❌ Gagal: ${recipient} (${err.message})`);
+      fs.appendFileSync(logFile, `${recipient},FAILED,${err.message}\n`);
     }
 
-    console.log(`💰 Sisa saldo: ${ethers.formatUnits(balance, decimals)} ${symbol}`);
-
-    // 💤 Delay antar transaksi (acak)
-    const sleep = delayMinMs + Math.random() * (delayMaxMs - delayMinMs);
-    console.log(`⏱️ Delay selama ${(sleep / 1000).toFixed(2)} detik...\n`);
-    await delay(sleep);
+    const delayTime = Math.floor(Math.random() * (maxDelay - minDelay + 1) + minDelay);
+    console.log(`⏳ Delay ${delayTime} detik...\n`);
+    await delay(delayTime * 1000);
   }
 
-  console.log(`✅ Semua transaksi selesai. Log tersimpan di: ${LOG_FILE}`);
+  console.log("\n📄 Selesai. Log disimpan di: batch-log.csv");
 }
 
-batchSend().catch(console.error);
+sendNativeTokens();
